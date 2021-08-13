@@ -39,6 +39,7 @@ export class CRNetworkManager {
   private _requestIdToRequestPausedEvent = new Map<string, Protocol.Fetch.requestPausedPayload>();
   private _eventListeners: RegisteredListener[];
   private _requestIdToExtraInfo = new Map<string, Protocol.Network.requestWillBeSentExtraInfoPayload>();
+  private _requestIdToResponseExtraInfo = new Map<string, Protocol.Network.responseReceivedExtraInfoPayload>();
 
   constructor(client: CRSession, page: Page, parentManager: CRNetworkManager | null) {
     this._client = client;
@@ -53,6 +54,7 @@ export class CRNetworkManager {
       eventsHelper.addEventListener(session, 'Fetch.authRequired', this._onAuthRequired.bind(this)),
       eventsHelper.addEventListener(session, 'Network.requestWillBeSent', this._onRequestWillBeSent.bind(this, workerFrame)),
       eventsHelper.addEventListener(session, 'Network.requestWillBeSentExtraInfo', this._onRequestWillBeSentExtraInfo.bind(this)),
+      eventsHelper.addEventListener(session, 'Network.responseReceivedExtraInfo', this._onResponseReceivedExtraInfo.bind(this)),
       eventsHelper.addEventListener(session, 'Network.responseReceived', this._onResponseReceived.bind(this)),
       eventsHelper.addEventListener(session, 'Network.loadingFinished', this._onLoadingFinished.bind(this)),
       eventsHelper.addEventListener(session, 'Network.loadingFailed', this._onLoadingFailed.bind(this)),
@@ -281,7 +283,7 @@ export class CRNetworkManager {
     this._page._frameManager.requestStarted(request.request, route || undefined);
   }
 
-  _createResponse(request: InterceptableRequest, responsePayload: Protocol.Network.Response): network.Response {
+  _createResponse(request: InterceptableRequest, responsePayload: Protocol.Network.Response, extraInfo: Protocol.Network.responseReceivedExtraInfoPayload|undefined): network.Response {
     const getResponseBody = async () => {
       const response = await this._client.send('Network.getResponseBody', { requestId: request._requestId });
       return Buffer.from(response.body, response.base64Encoded ? 'base64' : 'utf8');
@@ -311,7 +313,22 @@ export class CRNetworkManager {
         responseStart: -1,
       };
     }
-    const response = new network.Response(request.request, responsePayload.status, responsePayload.statusText, headersObjectToArray(responsePayload.headers), timing, getResponseBody, responsePayload.protocol);
+
+    let statusCode = responsePayload.status;
+    let headers = responsePayload.headers;
+    if (extraInfo && !this._protocolRequestInterceptionEnabled) {
+      statusCode = extraInfo.statusCode;
+      headers = extraInfo.headers;
+    }
+    const response = new network.Response(
+      request.request,
+      statusCode,
+      responsePayload.statusText, // TODO use first line of extraInfo.headersText
+      headersObjectToArray(headers),
+      timing,
+      getResponseBody,
+      responsePayload.protocol);
+
     if (responsePayload?.remoteIPAddress && typeof responsePayload?.remotePort === 'number') {
       response._serverAddrFinished({
         ipAddress: responsePayload.remoteIPAddress,
@@ -331,7 +348,7 @@ export class CRNetworkManager {
   }
 
   _handleRequestRedirect(request: InterceptableRequest, responsePayload: Protocol.Network.Response, timestamp: number) {
-    const response = this._createResponse(request, responsePayload);
+    const response = this._createResponse(request, responsePayload, undefined);
     response._requestFinished((timestamp - request._timestamp) * 1000, 'Response body is unavailable for redirect responses');
     this._requestIdToRequest.delete(request._requestId);
     if (request._interceptionId)
@@ -345,8 +362,22 @@ export class CRNetworkManager {
     // FileUpload sends a response without a matching request.
     if (!request)
       return;
-    const response = this._createResponse(request, event.response);
+    const response = this._createResponse(
+      request,
+      event.response,
+      this._requestIdToResponseExtraInfo.get(event.requestId));
     this._page._frameManager.requestReceivedResponse(response);
+  }
+
+  _onResponseReceivedExtraInfo(event: Protocol.Network.responseReceivedExtraInfoPayload) {
+    // responseReceivedExtraInfo may come after responseReceived due to lack of
+    // guarantees about the mojo messages being passed around the different
+    // processes, as caseq made me painfully aware of. However, in all my
+    // testing, I've always found that responseReceivedExtraInfo actually
+    // comes before responseReceived. In that case, we can just save the
+    // ExtraInfo here for the coming responseReceived event.
+    // TODO handle redirects somehow...?
+    this._requestIdToResponseExtraInfo.set(event.requestId, event);
   }
 
   _onLoadingFinished(event: Protocol.Network.loadingFinishedPayload) {
